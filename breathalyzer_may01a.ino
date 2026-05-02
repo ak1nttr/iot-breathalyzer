@@ -43,8 +43,8 @@
 #define HR_NORMAL_MAX             100
 
 #define MQ3_WARMUP_SECONDS        30
-#define MQ3_SAMPLE_COUNT          10
-#define MQ3_SAMPLE_DELAY_MS       10
+#define MQ3_SAMPLE_COUNT          5   // was 10
+#define MQ3_SAMPLE_DELAY_MS       5   // was 10ms — reduces per-read blocking from 100ms to 25ms
 #define MQ3_BASELINE_DEFAULT      300
 
 #define MQ3_BREATH_DETECT_FACTOR  1.05
@@ -507,7 +507,7 @@ void display_render(const DisplayData& data) {
   char buf[24];
 
   if (data.hasBAC) {
-    snprintf(buf, sizeof(buf), "%.2f %%", data.bacPercent);
+    snprintf(buf, sizeof(buf), "%.2f%% (%d)", data.bacPercent, lastResult.bacPeak);
   } else {
     snprintf(buf, sizeof(buf), "---");
   }
@@ -796,15 +796,37 @@ static void handleIdle() {
     // Anlık değeri oku
     int raw = mq3_readRaw();
     
+    if (DEBUG_SERIAL) {
+      Serial.print("[IDLE] BAC raw=");
+      Serial.print(raw);
+      Serial.print(" baseline=");
+      Serial.println(mq3Baseline);
+    }
+
+    lastResult.bacPeak     = raw;
+    lastResult.bacBaseline = mq3Baseline;
+
     // (Tamper) Kontrolü (8x sınırı aşıldıysa alarm ver)
     if (raw > mq3Baseline * MQ3_TAMPER_DETECT_FACTOR) {
       setState(STATE_TAMPER_REJECT);
       return;
     }
 
-    // 2. DİNAMİK BASELINE GÜNCELLEMESİ
-    // Eski baseline'ın %95'ini, yeni ölçümün %5'ini alarak yavaşça kaydır.
-    mq3Baseline = (int)((mq3Baseline * 0.95) + (raw * 0.05));
+    // Parmak yokken BAC yüksekse kullanıcıyı uyar.
+    BACLevel idleBAC = classifyBAC(raw);
+    if (idleBAC == BAC_MEDIUM || idleBAC == BAC_HIGH) {
+      feedback_setLEDs(false, true);
+      if (bzPattern == BZ_NONE) feedback_beepShort();
+    } else {
+      feedback_setLEDs(false, false);
+      feedback_silence();
+    }
+
+    // Dinamik baseline: sadece hava temizken (raw <= baseline * 1.02) güncelle.
+    // Eğer ortamda alkol varsa baseline yukarı sürüklenmesin.
+    if (raw <= (int)(mq3Baseline * 1.02f)) {
+      mq3Baseline = (int)((mq3Baseline * 0.95) + (raw * 0.05));
+    }
     
     // if (DEBUG_SERIAL) { Serial.print("Baseline: "); Serial.println(mq3Baseline); }
   }
@@ -843,9 +865,13 @@ static void handleMeasuringHR() {
 static void handleWaitingBreath() {
   unsigned long elapsedMs = elapsedInState();
   if (elapsedMs >= TIMEOUT_WAITING_BREATH_MS) {
-    if (DEBUG_SERIAL) Serial.println("[WAITING_BREATH] Timeout");
-    resetMeasurement();
-    setState(STATE_IDLE);
+    if (DEBUG_SERIAL) Serial.println("[WAITING_BREATH] Timeout -> classifying as SOBER (no breath detected)");
+    // No breath above threshold in 30s means BAC is at baseline = SOBER.
+    // Use the live reading captured during the wait as the peak, then classify normally.
+    lastResult.bacPeak     = mq3_readRaw();
+    lastResult.bacBaseline = mq3_getBaseline();
+    lastResult.timestamp   = millis();
+    setState(STATE_CLASSIFY);
     return;
   }
 
@@ -862,7 +888,16 @@ static void handleWaitingBreath() {
     // Cloud Dashboard variable'larını doğrudan güncelle
     bac_raw = liveRaw;
     bac_percent = adcToBACPercent(liveRaw, lastResult.bacBaseline);
-    
+
+    if (DEBUG_SERIAL) {
+      Serial.print("[WAITING] BAC raw=");
+      Serial.print(liveRaw);
+      Serial.print(" baseline=");
+      Serial.print(lastResult.bacBaseline);
+      Serial.print(" pct=");
+      Serial.println(bac_percent, 3);
+    }
+
     lastLiveUpdate = now;
   }
   
