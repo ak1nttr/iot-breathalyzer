@@ -55,8 +55,8 @@
 #define BREATH_PEAK_UPDATE_INTERVAL_MS 150
 #define POST_MEASUREMENT_COOLDOWN_MS 15000
 
-#define BAC_LOW_MAX               1700
-#define BAC_MEDIUM_MAX            2500
+#define BAC_LOW_FACTOR            1.37f   // baseline × 1.37 → IMPAIRED boundary (~0.08% BAC)
+#define BAC_MEDIUM_FACTOR         1.61f   // baseline × 1.61 → DANGEROUS boundary (~0.15% BAC)
 
 #define TIMEOUT_WAITING_BREATH_MS 30000
 #define MEASUREMENT_BREATH_MS     5000
@@ -130,6 +130,7 @@ struct DisplayData {
   float bacPercent;
   bool  hasHR;
   int   heartRate;
+  int   spo2;
   bool  hasStatus;
   ResultClass status;
   const char* stepText;
@@ -231,8 +232,8 @@ void  feedback_alarm();
 void  feedback_silence();
 void  feedback_playResult(ResultClass result);
 
-ResultClass classify(int bacPeak, int heartRate);
-BACLevel    classifyBAC(int bacPeak);
+ResultClass classify(int bacPeak, int baseline, int heartRate, int spo2);
+BACLevel    classifyBAC(int bacPeak, int baseline);
 HRStatus    classifyHR(int heartRate);
 const char* resultToString(ResultClass r);
 float       adcToBACPercent(int adcPeak, int baseline);
@@ -411,9 +412,11 @@ void max30102_resetHistory() {
 //   CLASSIFIER
 // =============================================================================
 
-BACLevel classifyBAC(int bacPeak) {
-  if (bacPeak <= BAC_LOW_MAX)    return BAC_LOW;
-  if (bacPeak <= BAC_MEDIUM_MAX) return BAC_MEDIUM;
+BACLevel classifyBAC(int bacPeak, int baseline) {
+  int lowMax    = (int)(baseline * BAC_LOW_FACTOR);
+  int mediumMax = (int)(baseline * BAC_MEDIUM_FACTOR);
+  if (bacPeak <= lowMax)    return BAC_LOW;
+  if (bacPeak <= mediumMax) return BAC_MEDIUM;
   return BAC_HIGH;
 }
 
@@ -424,11 +427,14 @@ HRStatus classifyHR(int heartRate) {
   return HR_ANOMALOUS;
 }
 
-ResultClass classify(int bacPeak, int heartRate) {
-  BACLevel bac = classifyBAC(bacPeak);
+ResultClass classify(int bacPeak, int baseline, int heartRate, int spo2) {
+  BACLevel bac = classifyBAC(bacPeak, baseline);
   HRStatus hr  = classifyHR(heartRate);
 
   if (bac == BAC_HIGH)   return RESULT_DANGEROUS;
+
+  if (bac == BAC_MEDIUM && spo2 > 0 && spo2 < 94) return RESULT_DANGEROUS;
+
   if (bac == BAC_MEDIUM) return RESULT_IMPAIRED;
 
   if (hr == HR_NORMAL)   return RESULT_SOBER;
@@ -447,17 +453,20 @@ const char* resultToString(ResultClass r) {
 float adcToBACPercent(int adcPeak, int baseline) {
   if (adcPeak <= baseline) return 0.0f;
 
-  if (adcPeak <= BAC_LOW_MAX) {
-    float ratio = (float)(adcPeak - baseline) / (float)(BAC_LOW_MAX - baseline);
+  int lowMax    = (int)(baseline * BAC_LOW_FACTOR);
+  int mediumMax = (int)(baseline * BAC_MEDIUM_FACTOR);
+
+  if (adcPeak <= lowMax) {
+    float ratio = (float)(adcPeak - baseline) / (float)(lowMax - baseline);
     return 0.08f * ratio;
   }
-  if (adcPeak <= BAC_MEDIUM_MAX) {
-    float ratio = (float)(adcPeak - BAC_LOW_MAX) / (float)(BAC_MEDIUM_MAX - BAC_LOW_MAX);
+  if (adcPeak <= mediumMax) {
+    float ratio = (float)(adcPeak - lowMax) / (float)(mediumMax - lowMax);
     return 0.08f + 0.07f * ratio;
   }
   int adcCap = 4095;
   if (adcPeak >= adcCap) return 0.30f;
-  float ratio = (float)(adcPeak - BAC_MEDIUM_MAX) / (float)(adcCap - BAC_MEDIUM_MAX);
+  float ratio = (float)(adcPeak - mediumMax) / (float)(adcCap - mediumMax);
   return 0.15f + 0.15f * ratio;
 }
 
@@ -514,7 +523,7 @@ void display_render(const DisplayData& data) {
   drawLabelValue(0, "BAC:", buf);
 
   if (data.hasHR) {
-    snprintf(buf, sizeof(buf), "%d bpm", data.heartRate);
+    snprintf(buf, sizeof(buf), "%dbpm %d%%", data.heartRate, data.spo2);
   } else {
     snprintf(buf, sizeof(buf), "---");
   }
@@ -747,7 +756,7 @@ static void refreshDisplay() {
     return;
   }
 
-  DisplayData d = { false, 0.0f, false, 0, false, RESULT_SOBER, currentStep };
+  DisplayData d = { false, 0.0f, false, 0, 0, false, RESULT_SOBER, currentStep };
 
   if (lastResult.bacPeak > 0) {
     d.hasBAC = true;
@@ -757,6 +766,7 @@ static void refreshDisplay() {
   if (lastResult.heartRate > 0) {
     d.hasHR = true;
     d.heartRate = lastResult.heartRate;
+    d.spo2 = lastResult.spo2;
   }
 
   if (currentState == STATE_RESULT || currentState == STATE_CLOUD_PUBLISH) {
@@ -813,7 +823,7 @@ static void handleIdle() {
     }
 
     // Parmak yokken BAC yüksekse kullanıcıyı uyar.
-    BACLevel idleBAC = classifyBAC(raw);
+    BACLevel idleBAC = classifyBAC(raw, mq3Baseline);
     if (idleBAC == BAC_MEDIUM || idleBAC == BAC_HIGH) {
       feedback_setLEDs(false, true);
       if (bzPattern == BZ_NONE) feedback_beepShort();
@@ -966,13 +976,15 @@ static void handleTamperReject() {
 }
 
 static void handleClassify() {
-  lastResultClass = classify(lastResult.bacPeak, lastResult.heartRate);
+  lastResultClass = classify(lastResult.bacPeak, lastResult.bacBaseline, lastResult.heartRate, lastResult.spo2);
 
   if (DEBUG_SERIAL) {
     Serial.print("[CLASSIFY] BAC=");
     Serial.print(lastResult.bacPeak);
     Serial.print(" HR=");
     Serial.print(lastResult.heartRate);
+    Serial.print(" SpO2=");
+    Serial.print(lastResult.spo2);
     Serial.print(" -> ");
     Serial.println(resultToString(lastResultClass));
   }
